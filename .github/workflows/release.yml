@@ -1,280 +1,168 @@
-name: Release
+name: Release & Publish for predictkit
 
-# Fires when any branch is merged into master
-# (We tag master on every merge, not just release/* branches)
 on:
   push:
     branches: [master]
+  pull_request:
+    branches: [master]
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  release:
-    name: Version bump, tag & GitHub Release
+  # ─────────────────────────────────────────
+  validate:
+    name: ✅ Validate Release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # push version-bump commit + tag
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+  # ─────────────────────────────────────────
+  version:
+    name: 🔖 Bump Version & Changelog
+    runs-on: ubuntu-latest
+    needs: validate
+    outputs:
+      new_version: ${{ steps.version.outputs.new_version }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        run: pip install -e ".[dev]" build twine
-
-      # ── 1. Read current version ──────────────────────────────────────────
-      - name: Read current version
-        id: current
+      - name: Configure git
         run: |
-          VERSION=$(python -c "
-          import tomllib
-          with open('pyproject.toml', 'rb') as f:
-              data = tomllib.load(f)
-          print(data['project']['version'])
-          ")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Current version: $VERSION"
-
-      # ── 2. Determine bump from conventional commits since last stable tag ─
-      #   Skips dev snapshot tags (v*-dev.*) — only looks at vX.Y.Z tags
-      - name: Determine version bump
-        id: bump
-        run: |
-          python3 - << 'PYEOF'
-          import subprocess, re, os
-
-          # Find last stable tag (ignores -dev.* tags)
-          result = subprocess.run(
-              ['git', 'tag', '--list', 'v[0-9]*'],
-              capture_output=True, text=True
-          )
-          stable_tags = [
-              t.strip() for t in result.stdout.strip().split('\n')
-              if t.strip() and '-dev.' not in t
-          ]
-
-          if stable_tags:
-              # Sort by version number
-              def parse(t):
-                  m = re.match(r'v(\d+)\.(\d+)\.(\d+)', t)
-                  return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
-              last_tag = sorted(stable_tags, key=parse)[-1]
-              log_range = f"{last_tag}..HEAD"
-          else:
-              last_tag = None
-              log_range = "HEAD"
-
-          print(f"Last stable tag: {last_tag or 'none (first release)'}")
-
-          result = subprocess.run(
-              ['git', 'log', log_range, '--format=%s'],
-              capture_output=True, text=True
-          )
-          commits = [
-              c.strip() for c in result.stdout.strip().split('\n')
-              if c.strip()
-              and not c.strip().startswith('Merge ')
-              and not re.match(r'^[Rr]evert', c.strip())
-              and not c.strip().startswith('chore: stamp dev version')
-              and not c.strip().startswith('chore: bump version')
-          ]
-
-          print(f"Commits to analyze: {len(commits)}")
-          for c in commits:
-              print(f"  - {c}")
-
-          bump = 'patch'
-          for commit in commits:
-              if 'BREAKING CHANGE' in commit or re.match(r'^[a-z]+(\(.+\))?!:', commit):
-                  bump = 'major'
-                  break
-              if re.match(r'^feat(\(.+\))?:', commit) and bump != 'major':
-                  bump = 'minor'
-
-          print(f"Determined bump: {bump}")
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"bump={bump}\n")
-          PYEOF
-
-      # ── 3. Calculate new stable version ──────────────────────────────────
-      - name: Calculate new version
-        id: new_version
-        run: |
-          python3 - << 'PYEOF'
-          import os
-          current = os.environ['CURRENT_VERSION']
-          bump    = os.environ['BUMP_TYPE']
-
-          # Strip any dev suffix that might be in pyproject.toml
-          base = current.split('-')[0]
-          major, minor, patch = map(int, base.split('.'))
-
-          if bump == 'major':
-              major += 1; minor = 0; patch = 0
-          elif bump == 'minor':
-              minor += 1; patch = 0
-          else:
-              patch += 1
-
-          new_version = f"{major}.{minor}.{patch}"
-          print(f"Version: {base} → {new_version} ({bump} bump)")
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"version={new_version}\n")
-          PYEOF
-        env:
-          CURRENT_VERSION: ${{ steps.current.outputs.version }}
-          BUMP_TYPE:        ${{ steps.bump.outputs.bump }}
-
-      # ── 4. Update pyproject.toml + __init__.py to stable version ─────────
-      - name: Update pyproject.toml
-        run: |
-          NEW="${{ steps.new_version.outputs.version }}"
-          sed -i "s/^version = \".*\"/version = \"${NEW}\"/" pyproject.toml
-          grep '^version' pyproject.toml
-
-      - name: Update predictkit/__init__.py
-        run: |
-          NEW="${{ steps.new_version.outputs.version }}"
-          sed -i "s/__version__ = \".*\"/__version__ = \"${NEW}\"/" predictkit/__init__.py
-          grep '__version__' predictkit/__init__.py
-
-      # ── 5. Tests + build ─────────────────────────────────────────────────
-      - name: Run full test suite
-        run: pytest tests/ -v --tb=short
-
-      - name: Build distribution
-        run: python -m build
-
-      - name: Verify distribution
-        run: twine check dist/*
-
-      # ── 6. Generate changelog ─────────────────────────────────────────────
-      - name: Generate changelog
-        run: |
-          python3 - << 'PYEOF'
-          import subprocess, re, os
-
-          result = subprocess.run(
-              ['git', 'tag', '--list', 'v[0-9]*'],
-              capture_output=True, text=True
-          )
-          stable_tags = [
-              t.strip() for t in result.stdout.strip().split('\n')
-              if t.strip() and '-dev.' not in t
-          ]
-          if stable_tags:
-              def parse(t):
-                  m = re.match(r'v(\d+)\.(\d+)\.(\d+)', t)
-                  return tuple(int(x) for x in m.groups()) if m else (0,0,0)
-              last_tag   = sorted(stable_tags, key=parse)[-1]
-              log_range  = f"{last_tag}..HEAD"
-          else:
-              log_range = "HEAD"
-
-          result = subprocess.run(
-              ['git', 'log', log_range, '--format=%s'],
-              capture_output=True, text=True
-          )
-          commits = [
-              c.strip() for c in result.stdout.strip().split('\n')
-              if c.strip()
-              and not c.strip().startswith('Merge ')
-              and not re.match(r'^[Rr]evert', c.strip())
-              and not c.strip().startswith('chore: stamp dev version')
-              and not c.strip().startswith('chore: bump version')
-          ]
-
-          sections = {
-              'feat':     ('🚀 Features',      []),
-              'fix':      ('🐛 Bug Fixes',      []),
-              'perf':     ('⚡ Performance',    []),
-              'refactor': ('♻️  Refactoring',   []),
-              'docs':     ('📚 Documentation',  []),
-              'test':     ('🧪 Tests',          []),
-              'build':    ('🏗️  Build',         []),
-              'ci':       ('👷 CI/CD',          []),
-              'chore':    ('🔧 Chores',         []),
-              'style':    ('💄 Style',          []),
-          }
-
-          for commit in commits:
-              m = re.match(r'^([a-z]+)(\(.+\))?!?:\s*(.+)', commit)
-              if m:
-                  type_  = m.group(1)
-                  scope  = f"**{m.group(2)[1:-1]}**: " if m.group(2) else ""
-                  msg    = m.group(3)
-                  if type_ in sections:
-                      sections[type_][1].append(f"- {scope}{msg}")
-
-          lines = ["## What's Changed\n"]
-          for key, (title, items) in sections.items():
-              if items:
-                  lines.append(f"### {title}")
-                  lines.extend(items)
-                  lines.append("")
-
-          changelog = "\n".join(lines)
-          with open('RELEASE_NOTES.md', 'w') as f:
-              f.write(changelog)
-          print(changelog)
-          PYEOF
-
-      # ── 7. Commit version bump ────────────────────────────────────────────
-      - name: Commit version bump
-        run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml predictkit/__init__.py
-          git commit -m "chore: bump version to ${{ steps.new_version.outputs.version }} [skip ci]"
 
-      # ── 8. Tag + push ─────────────────────────────────────────────────────
-      - name: Create and push stable release tag
+      - name: Get latest dev tag for version
+        id: version
         run: |
-          TAG="v${{ steps.new_version.outputs.version }}"
-          git tag -a "$TAG" -m "Release $TAG"
-          git push origin HEAD:master --follow-tags
-          echo "✅ Pushed stable tag: $TAG"
+          # Get latest dev tag (e.g. v1.2.3-dev.5 → v1.2.3)
+          LATEST_DEV=$(git tag --list '*-dev.*' --sort=-version:refname | head -1)
+          
+          if [ -z "$LATEST_DEV" ]; then
+            NEW_VERSION="0.1.0"
+          else
+            NEW_VERSION=$(echo "$LATEST_DEV" | sed 's/-dev\..*//')
+          fi
 
-      # ── 9. GitHub Release ─────────────────────────────────────────────────
-      - name: Create GitHub Release
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs   = require('fs');
-            const notes = fs.readFileSync('RELEASE_NOTES.md', 'utf8');
-            const tag   = `v${{ steps.new_version.outputs.version }}`;
-            await github.rest.repos.createRelease({
-              owner:      context.repo.owner,
-              repo:       context.repo.repo,
-              tag_name:   tag,
-              name:       `PredictKit ${tag}`,
-              body:       notes,
-              draft:      false,
-              prerelease: false,
-            });
-            console.log(`✅ GitHub Release created: ${tag}`);
+          echo "Release version from dev tag: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-${{ steps.new_version.outputs.version }}
-          path: dist/
-
-      # ── 10. Summary ───────────────────────────────────────────────────────
-      - name: Print summary
+      - name: Generate changelog
+        id: changelog
         run: |
-          echo "### 🚀 Release Published" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Tag | \`v${{ steps.new_version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Bump | \`${{ steps.bump.outputs.bump }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Branch | \`master\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          VERSION=${{ steps.version.outputs.new_version }}
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" HEAD)
+          else
+            COMMITS=$(git log --pretty=format:"- %s (%h)" $LAST_TAG..HEAD)
+          fi
+
+          # Group commits
+          FEATURES=$(echo "$COMMITS" | grep "^- feat" || true)
+          FIXES=$(echo "$COMMITS" | grep "^- fix" || true)
+          BREAKING=$(echo "$COMMITS" | grep -E "^- (breaking|feat)!" || true)
+          OTHERS=$(echo "$COMMITS" | grep -vE "^- (feat|fix|breaking)" || true)
+
+          CHANGELOG="## predictkit v$VERSION — $(date +'%B %d, %Y')\n\n"
+          [ -n "$BREAKING" ] && CHANGELOG="${CHANGELOG}### 🚨 Breaking Changes\n$BREAKING\n\n"
+          [ -n "$FEATURES" ] && CHANGELOG="${CHANGELOG}### ✨ Features\n$FEATURES\n\n"
+          [ -n "$FIXES" ] && CHANGELOG="${CHANGELOG}### 🐛 Fixes\n$FIXES\n\n"
+          [ -n "$OTHERS" ] && CHANGELOG="${CHANGELOG}### 📦 Other\n$OTHERS"
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Update CHANGELOG.md
+        run: |
+          VERSION=${{ steps.version.outputs.new_version }}
+          CHANGELOG="${{ steps.changelog.outputs.changelog }}"
+          
+          if [ -f CHANGELOG.md ]; then
+            echo -e "$CHANGELOG\n\n$(cat CHANGELOG.md)" > CHANGELOG.md
+          else
+            echo -e "$CHANGELOG" > CHANGELOG.md
+          fi
+          git add CHANGELOG.md
+          git commit -m "docs(changelog): v$VERSION [skip ci]" || true
+          git push origin master
+
+  # ─────────────────────────────────────────
+  tag:
+    name: 🏷️ Create Git Tag
+    runs-on: ubuntu-latest
+    needs: version
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create tag
+        run: |
+          VERSION=${{ needs.version.outputs.new_version }}
+          git tag -a "v$VERSION" -m "predictkit v$VERSION"
+          git push origin "v$VERSION"
+
+  # ─────────────────────────────────────────
+  release:
+    name: 🚀 GitHub Release
+    runs-on: ubuntu-latest
+    needs: [version, tag]
+
+    steps:
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ needs.version.outputs.new_version }}
+          release_name: predictkit v${{ needs.version.outputs.new_version }}
+          body: ${{ needs.version.outputs.changelog }}
+          draft: false
+          prerelease: false
+
+  # ─────────────────────────────────────────
+  sync:
+    name: 🔄 Sync master → dev
+    runs-on: ubuntu-latest
+    needs: release
+
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge master → dev
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          git merge origin/master --no-ff -m "chore(sync): merge master release"
+          git push origin dev

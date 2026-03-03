@@ -11,7 +11,7 @@ Example::
     stream.start()
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.0-dev.1"
 __author__ = "PredictKit Contributors"
 __license__ = "MIT"
 

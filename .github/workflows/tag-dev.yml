@@ -1,0 +1,105 @@
+name: Tag Dev Snapshot
+
+# Fires on every push to dev (including PR merges)
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  tag-snapshot:
+    name: Create dev snapshot tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push tags + version-bump commit
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history — needed to find latest tags
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ── 1. Read current release version from pyproject.toml ───────────────
+      - name: Read base version from pyproject.toml
+        id: base
+        run: |
+          VERSION=$(python -c "
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              data = tomllib.load(f)
+          print(data['project']['version'])
+          ")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Base version: $VERSION"
+
+      # ── 2. Find the next dev build number ─────────────────────────────────
+      #   Scans existing tags matching  v<base>-dev.*  and picks max(N) + 1
+      - name: Calculate next dev build number
+        id: devnum
+        run: |
+          BASE="${{ steps.base.outputs.version }}"
+          # List all tags matching v<base>-dev.<number>
+          LATEST=$(git tag --list "v${BASE}-dev.*" \
+            | grep -oP '(?<=-dev\.)\d+' \
+            | sort -n | tail -1)
+          if [ -z "$LATEST" ]; then
+            NEXT=1
+          else
+            NEXT=$((LATEST + 1))
+          fi
+          echo "next=$NEXT" >> $GITHUB_OUTPUT
+          echo "Next dev build: $NEXT"
+
+      # ── 3. Compose the full tag string ────────────────────────────────────
+      - name: Compose snapshot tag
+        id: tag
+        run: |
+          TAG="v${{ steps.base.outputs.version }}-dev.${{ steps.devnum.outputs.next }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Snapshot tag: $TAG"
+
+      # ── 4. Update __init__.py to carry the dev version (optional but useful
+      #       for runtime introspection: predictkit.__version__ == "0.1.0-dev.3")
+      - name: Stamp dev version into __init__.py
+        run: |
+          DEV_VER="${{ steps.base.outputs.version }}-dev.${{ steps.devnum.outputs.next }}"
+          sed -i "s/__version__ = \".*\"/__version__ = \"${DEV_VER}\"/" predictkit/__init__.py
+          grep '__version__' predictkit/__init__.py
+
+      # ── 5. Commit the stamped __init__.py back to dev ─────────────────────
+      - name: Commit dev version stamp
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Only commit if there's actually a change (idempotent)
+          if git diff --quiet; then
+            echo "No changes to commit"
+          else
+            git add predictkit/__init__.py
+            git commit -m "chore: stamp dev version ${{ steps.tag.outputs.tag }} [skip ci]"
+            git push origin dev
+          fi
+
+      # ── 6. Create and push the lightweight snapshot tag ───────────────────
+      - name: Push snapshot tag
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          git tag -a "$TAG" -m "Dev snapshot $TAG"
+          git push origin "$TAG"
+          echo "✅ Pushed tag: $TAG"
+
+      # ── 7. Summary in the Actions run log ─────────────────────────────────
+      - name: Print summary
+        run: |
+          echo "### 🔖 Dev Snapshot Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ steps.tag.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`dev\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

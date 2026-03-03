@@ -1,19 +1,17 @@
 name: Release
 
+# Fires when any branch is merged into master
+# (We tag master on every merge, not just release/* branches)
 on:
-  pull_request:
+  push:
     branches: [master]
-    types: [closed]
 
 jobs:
   release:
-    name: Version bump, tag, GitHub Release
-    if: |
-      github.event.pull_request.merged == true &&
-      startsWith(github.event.pull_request.head.ref, 'release/')
+    name: Version bump, tag & GitHub Release
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write   # push version-bump commit + tag
 
     steps:
       - uses: actions/checkout@v4
@@ -29,120 +27,254 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]" build twine
 
-      - name: Get current version
-        id: current_version
+      # ── 1. Read current version ──────────────────────────────────────────
+      - name: Read current version
+        id: current
         run: |
           VERSION=$(python -c "
           import tomllib
-          with open('pyproject.toml','rb') as f:
-              print(tomllib.load(f)['project']['version'])
+          with open('pyproject.toml', 'rb') as f:
+              data = tomllib.load(f)
+          print(data['project']['version'])
           ")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $VERSION"
 
-      - name: Determine bump type
+      # ── 2. Determine bump from conventional commits since last stable tag ─
+      #   Skips dev snapshot tags (v*-dev.*) — only looks at vX.Y.Z tags
+      - name: Determine version bump
         id: bump
         run: |
           python3 - << 'PYEOF'
           import subprocess, re, os
-          result = subprocess.run(['git','describe','--tags','--abbrev=0'], capture_output=True, text=True)
-          log_range = f"{result.stdout.strip()}..HEAD" if result.returncode == 0 else "HEAD"
+
+          # Find last stable tag (ignores -dev.* tags)
+          result = subprocess.run(
+              ['git', 'tag', '--list', 'v[0-9]*'],
+              capture_output=True, text=True
+          )
+          stable_tags = [
+              t.strip() for t in result.stdout.strip().split('\n')
+              if t.strip() and '-dev.' not in t
+          ]
+
+          if stable_tags:
+              # Sort by version number
+              def parse(t):
+                  m = re.match(r'v(\d+)\.(\d+)\.(\d+)', t)
+                  return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+              last_tag = sorted(stable_tags, key=parse)[-1]
+              log_range = f"{last_tag}..HEAD"
+          else:
+              last_tag = None
+              log_range = "HEAD"
+
+          print(f"Last stable tag: {last_tag or 'none (first release)'}")
+
+          result = subprocess.run(
+              ['git', 'log', log_range, '--format=%s'],
+              capture_output=True, text=True
+          )
           commits = [
-              c.strip() for c in
-              subprocess.run(['git','log', log_range,'--format=%s'], capture_output=True, text=True).stdout.split('\n')
+              c.strip() for c in result.stdout.strip().split('\n')
               if c.strip()
               and not c.strip().startswith('Merge ')
               and not re.match(r'^[Rr]evert', c.strip())
+              and not c.strip().startswith('chore: stamp dev version')
+              and not c.strip().startswith('chore: bump version')
           ]
-          bump = 'patch'
+
+          print(f"Commits to analyze: {len(commits)}")
           for c in commits:
-              if 'BREAKING CHANGE' in c or re.match(r'^[a-z]+[\w-]*(\(.+\))?!:', c):
-                  bump = 'major'; break
-              if re.match(r'^feat(\(.+\))?:', c) and bump != 'major':
+              print(f"  - {c}")
+
+          bump = 'patch'
+          for commit in commits:
+              if 'BREAKING CHANGE' in commit or re.match(r'^[a-z]+(\(.+\))?!:', commit):
+                  bump = 'major'
+                  break
+              if re.match(r'^feat(\(.+\))?:', commit) and bump != 'major':
                   bump = 'minor'
-          print(f"Bump: {bump}")
+
+          print(f"Determined bump: {bump}")
+
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"bump={bump}\n")
           PYEOF
 
+      # ── 3. Calculate new stable version ──────────────────────────────────
       - name: Calculate new version
         id: new_version
         run: |
           python3 - << 'PYEOF'
           import os
-          cur = os.environ['CURRENT_VERSION']
-          bump = os.environ['BUMP_TYPE']
-          a, b, c = map(int, cur.split('.'))
-          if bump == 'major':   a+=1; b=0; c=0
-          elif bump == 'minor': b+=1; c=0
-          else:                 c+=1
-          v = f"{a}.{b}.{c}"
-          print(f"{cur} -> {v}")
+          current = os.environ['CURRENT_VERSION']
+          bump    = os.environ['BUMP_TYPE']
+
+          # Strip any dev suffix that might be in pyproject.toml
+          base = current.split('-')[0]
+          major, minor, patch = map(int, base.split('.'))
+
+          if bump == 'major':
+              major += 1; minor = 0; patch = 0
+          elif bump == 'minor':
+              minor += 1; patch = 0
+          else:
+              patch += 1
+
+          new_version = f"{major}.{minor}.{patch}"
+          print(f"Version: {base} → {new_version} ({bump} bump)")
+
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"version={v}\n")
+              f.write(f"version={new_version}\n")
           PYEOF
         env:
-          CURRENT_VERSION: ${{ steps.current_version.outputs.version }}
-          BUMP_TYPE: ${{ steps.bump.outputs.bump }}
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+          BUMP_TYPE:        ${{ steps.bump.outputs.bump }}
 
-      - name: Bump version in pyproject.toml
-        run: sed -i 's/^version = ".*"/version = "${{ steps.new_version.outputs.version }}"/' pyproject.toml
+      # ── 4. Update pyproject.toml + __init__.py to stable version ─────────
+      - name: Update pyproject.toml
+        run: |
+          NEW="${{ steps.new_version.outputs.version }}"
+          sed -i "s/^version = \".*\"/version = \"${NEW}\"/" pyproject.toml
+          grep '^version' pyproject.toml
 
-      - name: Bump version in __init__.py
-        run: sed -i 's/__version__ = ".*"/__version__ = "${{ steps.new_version.outputs.version }}"/' predictkit/__init__.py
+      - name: Update predictkit/__init__.py
+        run: |
+          NEW="${{ steps.new_version.outputs.version }}"
+          sed -i "s/__version__ = \".*\"/__version__ = \"${NEW}\"/" predictkit/__init__.py
+          grep '__version__' predictkit/__init__.py
 
-      - name: Run tests
+      # ── 5. Tests + build ─────────────────────────────────────────────────
+      - name: Run full test suite
         run: pytest tests/ -v --tb=short
 
-      - name: Build + verify
-        run: python -m build && twine check dist/*
+      - name: Build distribution
+        run: python -m build
 
-      - name: Generate release notes
+      - name: Verify distribution
+        run: twine check dist/*
+
+      # ── 6. Generate changelog ─────────────────────────────────────────────
+      - name: Generate changelog
         run: |
           python3 - << 'PYEOF'
-          import subprocess, re
-          result = subprocess.run(['git','describe','--tags','--abbrev=0'], capture_output=True, text=True)
-          log_range = f"{result.stdout.strip()}..HEAD" if result.returncode == 0 else "HEAD"
-          commits = [
-              c.strip() for c in
-              subprocess.run(['git','log', log_range,'--format=%s'], capture_output=True, text=True).stdout.split('\n')
-              if c.strip() and not c.strip().startswith('Merge ') and not re.match(r'^[Rr]evert', c.strip())
+          import subprocess, re, os
+
+          result = subprocess.run(
+              ['git', 'tag', '--list', 'v[0-9]*'],
+              capture_output=True, text=True
+          )
+          stable_tags = [
+              t.strip() for t in result.stdout.strip().split('\n')
+              if t.strip() and '-dev.' not in t
           ]
-          sections = {'feat':('Features',[]),'fix':('Bug Fixes',[]),'perf':('Performance',[]),
-                      'refactor':('Refactoring',[]),'docs':('Documentation',[]),'test':('Tests',[]),
-                      'build':('Build',[]),'ci':('CI/CD',[]),'chore':('Chores',[]),'style':('Style',[])}
-          for c in commits:
-              m = re.match(r'^([a-z]+)(\(.+\))?!?:\s*(.+)', c)
-              if m and m.group(1) in sections:
-                  scope = f"**{m.group(2)[1:-1]}**: " if m.group(2) else ""
-                  sections[m.group(1)][1].append(f"- {scope}{m.group(3)}")
+          if stable_tags:
+              def parse(t):
+                  m = re.match(r'v(\d+)\.(\d+)\.(\d+)', t)
+                  return tuple(int(x) for x in m.groups()) if m else (0,0,0)
+              last_tag   = sorted(stable_tags, key=parse)[-1]
+              log_range  = f"{last_tag}..HEAD"
+          else:
+              log_range = "HEAD"
+
+          result = subprocess.run(
+              ['git', 'log', log_range, '--format=%s'],
+              capture_output=True, text=True
+          )
+          commits = [
+              c.strip() for c in result.stdout.strip().split('\n')
+              if c.strip()
+              and not c.strip().startswith('Merge ')
+              and not re.match(r'^[Rr]evert', c.strip())
+              and not c.strip().startswith('chore: stamp dev version')
+              and not c.strip().startswith('chore: bump version')
+          ]
+
+          sections = {
+              'feat':     ('🚀 Features',      []),
+              'fix':      ('🐛 Bug Fixes',      []),
+              'perf':     ('⚡ Performance',    []),
+              'refactor': ('♻️  Refactoring',   []),
+              'docs':     ('📚 Documentation',  []),
+              'test':     ('🧪 Tests',          []),
+              'build':    ('🏗️  Build',         []),
+              'ci':       ('👷 CI/CD',          []),
+              'chore':    ('🔧 Chores',         []),
+              'style':    ('💄 Style',          []),
+          }
+
+          for commit in commits:
+              m = re.match(r'^([a-z]+)(\(.+\))?!?:\s*(.+)', commit)
+              if m:
+                  type_  = m.group(1)
+                  scope  = f"**{m.group(2)[1:-1]}**: " if m.group(2) else ""
+                  msg    = m.group(3)
+                  if type_ in sections:
+                      sections[type_][1].append(f"- {scope}{msg}")
+
           lines = ["## What's Changed\n"]
-          for _, (title, items) in sections.items():
-              if items: lines += [f"### {title}"] + items + [""]
-          open('RELEASE_NOTES.md','w').write('\n'.join(lines))
+          for key, (title, items) in sections.items():
+              if items:
+                  lines.append(f"### {title}")
+                  lines.extend(items)
+                  lines.append("")
+
+          changelog = "\n".join(lines)
+          with open('RELEASE_NOTES.md', 'w') as f:
+              f.write(changelog)
+          print(changelog)
           PYEOF
 
+      # ── 7. Commit version bump ────────────────────────────────────────────
       - name: Commit version bump
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add pyproject.toml predictkit/__init__.py
           git commit -m "chore: bump version to ${{ steps.new_version.outputs.version }} [skip ci]"
 
-      - name: Tag and push
+      # ── 8. Tag + push ─────────────────────────────────────────────────────
+      - name: Create and push stable release tag
         run: |
           TAG="v${{ steps.new_version.outputs.version }}"
           git tag -a "$TAG" -m "Release $TAG"
           git push origin HEAD:master --follow-tags
+          echo "✅ Pushed stable tag: $TAG"
 
+      # ── 9. GitHub Release ─────────────────────────────────────────────────
       - name: Create GitHub Release
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-            const tag = `v${{ steps.new_version.outputs.version }}`;
+            const fs   = require('fs');
+            const notes = fs.readFileSync('RELEASE_NOTES.md', 'utf8');
+            const tag   = `v${{ steps.new_version.outputs.version }}`;
             await github.rest.repos.createRelease({
-              owner: context.repo.owner, repo: context.repo.repo,
-              tag_name: tag, name: `PredictKit ${tag}`,
-              body: fs.readFileSync('RELEASE_NOTES.md', 'utf8'),
-              draft: false, prerelease: false,
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              tag_name:   tag,
+              name:       `PredictKit ${tag}`,
+              body:       notes,
+              draft:      false,
+              prerelease: false,
             });
+            console.log(`✅ GitHub Release created: ${tag}`);
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ steps.new_version.outputs.version }}
+          path: dist/
+
+      # ── 10. Summary ───────────────────────────────────────────────────────
+      - name: Print summary
+        run: |
+          echo "### 🚀 Release Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`v${{ steps.new_version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bump | \`${{ steps.bump.outputs.bump }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`master\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY

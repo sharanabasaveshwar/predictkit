@@ -1,25 +1,51 @@
 # Contributing to PredictKit
 
-Thank you for your interest! 🎉
+Thanks for your interest! This file is a quick reference.
+For the full contribution guide including the branch strategy, commit format,
+CI checks, and release process, see the
+[Contributing section in the README](README.md#contributing).
 
-## Setup
+---
+
+## Quick start
 
 ```bash
 git clone https://github.com/sharanabasaveshwar/predictkit.git
 cd predictkit
+git checkout dev && git pull origin dev
+git checkout -b feature/your-feature
 pip install -e ".[dev]"
-python -m pytest tests/
+# ... make changes, add tests ...
+pytest tests/ -v
+git commit -m "feat(scope): short description in lowercase"
+git push origin feature/your-feature
+# Open PR targeting dev
 ```
 
-## How to contribute
+## Conventional commit types
 
-1. Fork the repo and create a branch: `git checkout -b feature/my-feature`
-2. Make changes and add tests
-3. Run: `pytest` and `ruff check .`
-4. Open a Pull Request
+```
+feat:      new feature            →  minor version bump
+fix:       bug fix                →  patch version bump
+feat!:     breaking change        →  major version bump
+docs:      documentation
+style:     formatting only
+refactor:  restructure (no fix/feature)
+perf:      performance
+test:      tests
+build:     packaging / deps
+ci:        CI/CD workflows
+chore:     maintenance
+```
 
-## What we welcome
-- Bug fixes
-- New protocol drivers (implement `SensorDriver` interface)
-- Documentation improvements
-- Example projects
+Format: `type(optional-scope): lowercase description`
+
+Merge commits and revert commits are exempt.
+
+## PR checklist
+
+- [ ] Branched from `dev`
+- [ ] All tests pass locally (`pytest tests/ -v`)
+- [ ] New code has tests
+- [ ] All commits follow conventional commit format
+- [ ] PR targets `dev`, not `master`

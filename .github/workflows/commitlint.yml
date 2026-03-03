@@ -1,0 +1,54 @@
+name: Conventional Commits
+
+on:
+  pull_request:
+    branches: [dev, master]
+
+jobs:
+  commitlint:
+    name: Lint commit messages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install commitlint
+        run: npm install --save-dev @commitlint/cli @commitlint/config-conventional
+
+      - name: Write config
+        run: |
+          cat > commitlint.config.js << 'EOF'
+          module.exports = {
+            extends: ['@commitlint/config-conventional'],
+            rules: {
+              'type-enum': [2, 'always', [
+                'feat','fix','docs','style','refactor',
+                'perf','test','build','ci','chore',
+              ]],
+              'type-case': [2, 'always', 'lower-case'],
+              'type-empty': [2, 'never'],
+              'subject-empty': [2, 'never'],
+              'subject-case': [2, 'always', 'lower-case'],
+              'header-max-length': [2, 'always', 120],
+            },
+          };
+          EOF
+
+      - name: Lint commits (skip merge and revert)
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          git log "$BASE..$HEAD" --format="%H|%s" | while IFS='|' read sha subject; do
+            if echo "$subject" | grep -qE "^Merge |^Revert |^revert:"; then
+              echo "Skipping: $subject"
+              continue
+            fi
+            echo "Checking: $subject"
+            echo "$subject" | npx --no-install commitlint
+          done
+          echo "All commits passed."

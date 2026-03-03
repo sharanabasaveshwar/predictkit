@@ -1,21 +1,21 @@
 name: Tag Dev Snapshot
-
 # Fires on every push to dev (including PR merges)
+
 on:
   push:
     branches: [dev]
 
 jobs:
   tag-snapshot:
-    name: Create dev snapshot tag
+    name: 🏷️ Create Dev Snapshot
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # push tags + version-bump commit
+      contents: write  # push tags + version-bump commit
 
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # full history — needed to find latest tags
+          fetch-depth: 0  # full history — needed to find latest tags
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
@@ -23,83 +23,85 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # ── 1. Read current release version from pyproject.toml ───────────────
-      - name: Read base version from pyproject.toml
-        id: base
+      - name: Configure git
         run: |
-          VERSION=$(python -c "
-          import tomllib
-          with open('pyproject.toml', 'rb') as f:
-              data = tomllib.load(f)
-          print(data['project']['version'])
-          ")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Base version: $VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # ── 2. Find the next dev build number ─────────────────────────────────
-      #   Scans existing tags matching  v<base>-dev.*  and picks max(N) + 1
-      - name: Calculate next dev build number
-        id: devnum
+      # ── 1. SMART VERSIONING (from dev-tag.yml) ──────────────────────────
+      - name: Calculate next dev version
+        id: version
         run: |
-          BASE="${{ steps.base.outputs.version }}"
-          # List all tags matching v<base>-dev.<number>
-          LATEST=$(git tag --list "v${BASE}-dev.*" \
-            | grep -oP '(?<=-dev\.)\d+' \
-            | sort -n | tail -1)
-          if [ -z "$LATEST" ]; then
-            NEXT=1
+          # Get last STABLE release tag
+          LAST_STABLE=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" \
+            | grep -v "-dev" \
+            | sort -V | tail -1)
+          
+          [ -z "$LAST_STABLE" ] && LAST_STABLE="none"
+          echo "Last stable: $LAST_STABLE"
+
+          # Parse MAJOR.MINOR.PATCH
+          if [ "$LAST_STABLE" = "none" ]; then
+            MAJOR=0; MINOR=0; PATCH=0
           else
-            NEXT=$((LATEST + 1))
+            CURRENT=${LAST_STABLE#v}
+            MAJOR=$(echo $CURRENT | cut -d. -f1)
+            MINOR=$(echo $CURRENT | cut -d. -f2)
+            PATCH=$(echo $CURRENT | cut -d. -f3)
           fi
-          echo "next=$NEXT" >> $GITHUB_OUTPUT
-          echo "Next dev build: $NEXT"
 
-      # ── 3. Compose the full tag string ────────────────────────────────────
-      - name: Compose snapshot tag
-        id: tag
-        run: |
-          TAG="v${{ steps.base.outputs.version }}-dev.${{ steps.devnum.outputs.next }}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "Snapshot tag: $TAG"
+          # Analyze commits since stable for bump
+          if [ "$LAST_STABLE" = "none" ]; then
+            COMMITS=$(git log --pretty=format:"%s" HEAD)
+          else
+            COMMITS=$(git log --pretty=format:"%s" $LAST_STABLE..HEAD)
+          fi
 
-      # ── 4. Update __init__.py to carry the dev version (optional but useful
-      #       for runtime introspection: predictkit.__version__ == "0.1.0-dev.3")
+          # SEMVER BUMP LOGIC
+          if echo "$COMMITS" | grep -qE "^(feat!|BREAKING CHANGE|breaking)"; then
+            NEXT_STABLE="$((MAJOR + 1)).0.0"
+          elif echo "$COMMITS" | grep -qE "^feat"; then
+            NEXT_STABLE="${MAJOR}.$((MINOR + 1)).0"
+          else
+            NEXT_STABLE="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          # Dev build number
+          LAST_DEV=$(git tag -l "v${NEXT_STABLE}-dev.*" | sort -V | tail -1)
+          BUILD=$(echo $LAST_DEV | grep -oE "dev\.[0-9]+" | cut -d. -f2)
+          BUILD=$((BUILD + 1)); [ -z "$BUILD" ] && BUILD=1
+
+          DEV_TAG="v${NEXT_STABLE}-dev.${BUILD}"
+          echo "dev_tag=$DEV_TAG" >> $GITHUB_OUTPUT
+          echo "Next dev tag: $DEV_TAG"
+
+      # ── 2. Update predictkit/__init__.py (from original tag-dev) ────────
       - name: Stamp dev version into __init__.py
         run: |
-          DEV_VER="${{ steps.base.outputs.version }}-dev.${{ steps.devnum.outputs.next }}"
-          sed -i "s/__version__ = \".*\"/__version__ = \"${DEV_VER}\"/" predictkit/__init__.py
+          DEV_VER="${{ steps.version.outputs.dev_tag }}"
+          sed -i "s/__version__ = \".*\"/__version__ = \"$DEV_VER\"/" predictkit/__init__.py
           grep '__version__' predictkit/__init__.py
 
-      # ── 5. Commit the stamped __init__.py back to dev ─────────────────────
       - name: Commit dev version stamp
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Only commit if there's actually a change (idempotent)
           if git diff --quiet; then
-            echo "No changes to commit"
+            echo "No version change needed"
           else
             git add predictkit/__init__.py
-            git commit -m "chore: stamp dev version ${{ steps.tag.outputs.tag }} [skip ci]"
+            git commit -m "chore: stamp dev version ${{ steps.version.outputs.dev_tag }} [skip ci]"
             git push origin dev
           fi
 
-      # ── 6. Create and push the lightweight snapshot tag ───────────────────
+      # ── 3. Create tag (from both) ──────────────────────────────────────
       - name: Push snapshot tag
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          git tag -a "$TAG" -m "Dev snapshot $TAG"
+          TAG="${{ steps.version.outputs.dev_tag }}"
+          git tag -a "$TAG" -m "Dev build: ${{ github.event.head_commit.message }} (${{ github.sha }})"
           git push origin "$TAG"
-          echo "✅ Pushed tag: $TAG"
+          echo "✅ Pushed: $TAG"
 
-      # ── 7. Summary in the Actions run log ─────────────────────────────────
-      - name: Print summary
+      - name: Summary
         run: |
-          echo "### 🔖 Dev Snapshot Created" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Tag | \`${{ steps.tag.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Branch | \`dev\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "### Dev Tag Created" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${{ steps.version.outputs.dev_tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | `${{ github.sha }}` |" >> $GITHUB_STEP_SUMMARY[file:142][file:141]

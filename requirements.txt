@@ -3,4 +3,3 @@
 #   pip install predictkit[mqtt]
 #   pip install predictkit[ml]
 #   pip install predictkit[all]
-# ---- for testing ----
